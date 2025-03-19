@@ -82,15 +82,8 @@ class SSIMLoss(nn.Module):
             return ssim_map.mean(1).mean(1).mean(1)
 
 
-def preprocess_patient_data(text, max_length=256):
-    """
-    Preprocess patient data text to binary representation.
-    Specifically optimized for the format:
-    
-    Name: XXX
-    Age: XXY
-    ID: CDSZZZZZ
-    """
+def preprocess_patient_data(text, max_length=512):  # Changed max_length to 512
+    """Preprocess patient data text to binary representation."""
     # Convert each character to its ASCII binary representation
     binary = ''.join([format(ord(c), '08b') for c in text])
     
