@@ -1,14 +1,152 @@
-# Define the EXACT architecture used during training
-# These should match the trained weights EXACTLY
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Import necessary components from your existing modules
-from models.decoder import EnhancedErrorCorrectionModule
-from models.feature_analyzer import DenseBlock, TransitionLayer, ChannelAttention, SpatialAttention
-from models.encoder import ResidualBlock
+# Import required components from your existing files
+# If you don't have these classes defined, you'll need to include their definitions here
 
+# DenseBlock and TransitionLayer from feature_analyzer.py
+class DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super(DenseLayer, self).__init__()
+        self.norm = nn.BatchNorm2d(in_channels)
+        self.conv = nn.Conv2d(in_channels, growth_rate, kernel_size=3, padding=1, bias=False)
+        
+    def forward(self, x):
+        out = self.conv(F.relu(self.norm(x)))
+        return torch.cat([x, out], 1)
+
+class DenseBlock(nn.Module):
+    def __init__(self, in_channels, growth_rate, num_layers):
+        super(DenseBlock, self).__init__()
+        self.layers = nn.ModuleList()
+        current_channels = in_channels
+        
+        for i in range(num_layers):
+            self.layers.append(DenseLayer(current_channels, growth_rate))
+            current_channels += growth_rate
+        
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+class TransitionLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(TransitionLayer, self).__init__()
+        self.norm = nn.BatchNorm2d(in_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+    def forward(self, x):
+        return self.pool(self.conv(F.relu(self.norm(x))))
+
+# Define attention mechanisms
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+        
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv(x)
+        return self.sigmoid(x)
+
+# Define ResidualBlock for the encoder
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResidualBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+        
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = F.relu(out)
+        return out
+
+# Define EnhancedErrorCorrectionModule for the decoder
+class EnhancedErrorCorrectionModule(nn.Module):
+    def __init__(self, message_length):
+        super(EnhancedErrorCorrectionModule, self).__init__()
+        
+        # Deeper network for better error correction
+        hidden_dim1 = min(message_length * 2, 1024)
+        hidden_dim2 = min(message_length * 4, 2048)
+        
+        self.correction_network = nn.Sequential(
+            nn.Linear(message_length, hidden_dim1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim2, hidden_dim1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(hidden_dim1, message_length),
+            nn.Sigmoid()
+        )
+        
+        # Confidence estimator
+        self.confidence_estimator = nn.Sequential(
+            nn.Linear(message_length, hidden_dim1),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim1, message_length),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, message_probs):
+        # Apply learned correction
+        corrected = self.correction_network(message_probs)
+        
+        # Hard decision threshold for binary values when in evaluation mode
+        if not self.training:
+            # Get confidence estimates
+            confidence = self.confidence_estimator(message_probs)
+            
+            # Adaptive thresholding based on confidence
+            base_threshold = 0.5
+            adaptive_offset = (confidence - 0.5) * 0.2
+            
+            # Apply different thresholds for each bit based on confidence
+            thresholds = base_threshold + adaptive_offset
+            
+            # Make hard decisions
+            hard_decisions = (corrected > thresholds).float()
+            return hard_decisions
+        
+        return corrected
+
+# Feature Analyzer with 784 features
 class ExactFeatureAnalyzer(nn.Module):
     def __init__(self, in_channels=1):
         super(ExactFeatureAnalyzer, self).__init__()
@@ -78,10 +216,9 @@ class ExactFeatureAnalyzer(nn.Module):
         
         return features
 
-
+# Encoder with exact architecture
 class ExactEnhancedEncoder(nn.Module):
-    """Encoder with EXACT architecture matching saved weights"""
-    def __init__(self, image_channels=1, message_length=256):
+    def __init__(self, image_channels=1, message_length=512):
         super(ExactEnhancedEncoder, self).__init__()
         
         # Initial convolution
@@ -167,10 +304,9 @@ class ExactEnhancedEncoder(nn.Module):
         
         return stego_image
 
-
+# Decoder with exact architecture
 class ExactEnhancedDecoder(nn.Module):
-    """Decoder with EXACT architecture matching saved weights"""
-    def __init__(self, image_channels=1, message_length=256):
+    def __init__(self, image_channels=1, message_length=512):
         super(ExactEnhancedDecoder, self).__init__()
         
         # Initial layers
