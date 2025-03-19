@@ -136,6 +136,19 @@ def embed_patient_data(image_path, text, model_path, output_path=None, message_l
         # Prepare text data
         binary_tensor = text_to_binary(text, message_length, with_error_correction=True).unsqueeze(0).to(device)
         
+        # Make sure binary_tensor has the right length
+        if hasattr(encoder, 'prep_msg') and hasattr(encoder.prep_msg, '0'):
+            expected_length = encoder.prep_msg[0].in_features
+            if binary_tensor.size(1) != expected_length:
+                print(f"Warning: Binary tensor length ({binary_tensor.size(1)}) doesn't match model's expected length ({expected_length}).")
+                # Resize to match
+                if binary_tensor.size(1) > expected_length:
+                    binary_tensor = binary_tensor[:, :expected_length]
+                else:
+                    padding = torch.zeros(1, expected_length - binary_tensor.size(1), device=device)
+                    binary_tensor = torch.cat([binary_tensor, padding], dim=1)
+                print(f"Adjusted tensor to length {binary_tensor.size(1)}")
+        
         # Generate stego image
         with torch.no_grad():
             # Get feature weights
@@ -173,7 +186,7 @@ if __name__ == "__main__":
     parser.add_argument('--text', type=str, required=True, help='Patient data text or path to text file')
     parser.add_argument('--model_path', type=str, default='./models/weights/final_models', help='Path to trained models')
     parser.add_argument('--output', type=str, help='Path to save the stego image')
-    parser.add_argument('--message_length', type=int, default=512, help='Maximum binary message length')
+    parser.add_argument('--message_length', type=int, default=256, help='Maximum binary message length')
     parser.add_argument('--use_enhanced_models', action='store_true', help='Use enhanced models for training')
     parser.add_argument('--image_size', type=int, default=512, help='Image size (square)')
     

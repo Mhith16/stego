@@ -122,7 +122,7 @@ def preprocess_image(image_path, target_size=(512, 512)):
     return transform(image).unsqueeze(0)  # Add batch dimension
 
 
-def extract_patient_data(stego_path, model_path, message_length=512, image_size=(512, 512), use_enhanced_models=True):
+def extract_patient_data(stego_path, model_path, message_length=256, image_size=(512, 512), use_enhanced_models=True):
     """
     Extract patient data from a stego image
     
@@ -151,6 +151,14 @@ def extract_patient_data(stego_path, model_path, message_length=512, image_size=
         
         # Load decoder model using the correct architecture
         _, _, decoder, _ = load_correct_models(args, device)
+        
+        # Get the actual message length from the decoder
+        if hasattr(decoder, 'fc_layers') and hasattr(decoder.fc_layers, '-1'):
+            actual_message_length = decoder.fc_layers[-1].out_features
+            print(f"Using message length {actual_message_length} based on decoder architecture")
+        else:
+            actual_message_length = message_length
+            print(f"Using specified message length: {message_length}")
         
         # Preprocess image
         stego_tensor = preprocess_image(stego_path, image_size).to(device)
@@ -190,7 +198,7 @@ if __name__ == "__main__":
     parser.add_argument('--image', type=str, required=True, help='Path to the stego image')
     parser.add_argument('--model_path', type=str, default='./models/weights/final_models', help='Path to trained models')
     parser.add_argument('--output', type=str, help='Path to save the extracted text (optional)')
-    parser.add_argument('--message_length', type=int, default=512, help='Binary message length')
+    parser.add_argument('--message_length', type=int, default=256, help='Binary message length')
     parser.add_argument('--use_enhanced_models', action='store_true', help='Use enhanced models')
     parser.add_argument('--image_size', type=int, default=512, help='Image size (square)')
     
