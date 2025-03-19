@@ -13,31 +13,45 @@ class ExactFeatureAnalyzer(nn.Module):
     def __init__(self, in_channels=1):
         super(ExactFeatureAnalyzer, self).__init__()
         
-        # Exact architecture from trained model with 1024 final features
+        # Calculate the exact feature counts based on your network
+        num_init_features = 64
+        growth_rate = 16
+        
         self.features = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels, num_init_features, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(num_init_features),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         
-        # Dense blocks and transitions to match the exact shape in the saved model
-        self.blocks = nn.ModuleList([
-            DenseBlock(64, 16, 3),      # Match block configuration
-            DenseBlock(112, 16, 6),     # Numbers adjusted to match saved weights
-            DenseBlock(208, 16, 12),    
-            DenseBlock(400, 16, 24)     # This produces exactly 1024 final features
-        ])
+        # Initialize with fewer features to match your expected output
+        # Block configuration creates a total of 784 features
+        num_features = num_init_features  # Start with 64
+        self.blocks = nn.ModuleList()
+        self.transitions = nn.ModuleList()
         
-        self.transitions = nn.ModuleList([
-            TransitionLayer(112, 112),
-            TransitionLayer(208, 208),
-            TransitionLayer(400, 400)
-        ])
+        # Block 1: 64 -> 64 + (3 * 16) = 112 features
+        self.blocks.append(DenseBlock(num_features, growth_rate, 3))
+        num_features += 3 * growth_rate  # 112
+        self.transitions.append(TransitionLayer(num_features, num_features))
         
-        # Final layers with EXACT 1024 features
-        self.final_norm = nn.BatchNorm2d(1024)  # Exact 1024 features to match saved model
-        self.final_conv = nn.Conv2d(1024, 1, kernel_size=1, bias=False)
+        # Block 2: 112 -> 112 + (6 * 16) = 208 features
+        self.blocks.append(DenseBlock(num_features, growth_rate, 6))
+        num_features += 6 * growth_rate  # 208
+        self.transitions.append(TransitionLayer(num_features, num_features))
+        
+        # Block 3: 208 -> 208 + (12 * 16) = 400 features
+        self.blocks.append(DenseBlock(num_features, growth_rate, 12))
+        num_features += 12 * growth_rate  # 400
+        self.transitions.append(TransitionLayer(num_features, num_features))
+        
+        # Block 4: 400 -> 400 + (24 * 16) = 784 features
+        self.blocks.append(DenseBlock(num_features, growth_rate, 24))
+        num_features += 24 * growth_rate  # 784
+        
+        # Use the actual number of features (784) instead of hardcoded 1024
+        self.final_norm = nn.BatchNorm2d(num_features)  # 784 features
+        self.final_conv = nn.Conv2d(num_features, 1, kernel_size=1, bias=False)
         self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
