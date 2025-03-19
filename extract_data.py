@@ -10,8 +10,8 @@ import sys
 # Add parent directory to path to access models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import models
-from models.decoder import EnhancedSteganographyDecoder, SteganographyDecoder
+# Import models and model loading function
+from model_config import load_correct_models
 
 
 def binary_to_text(binary_tensor, threshold=0.5, with_error_correction=True):
@@ -26,12 +26,24 @@ def binary_to_text(binary_tensor, threshold=0.5, with_error_correction=True):
     Returns:
         Extracted text string
     """
-    # Convert tensor to binary string
-    binary_output = (binary_tensor > threshold).int().cpu().numpy()
+    # Convert tensor to binary string with adaptive threshold
+    if isinstance(binary_tensor, torch.Tensor):
+        binary_output = (binary_tensor > threshold).int().cpu().numpy()
+    else:
+        binary_output = (np.array(binary_tensor) > threshold).astype(int)
+        
     binary_string = ''.join(['1' if bit else '0' for bit in binary_output])
     
     # Remove padding zeros from the end
-    binary_string = binary_string.rstrip('0')
+    # Find the last '1' bit and keep everything before it plus 8 bits 
+    # (to ensure we don't cut off in the middle of a character)
+    try:
+        last_one_index = binary_string.rindex('1')
+        end_index = min(last_one_index + 9, len(binary_string))
+        binary_string = binary_string[:end_index]
+    except ValueError:
+        # No '1' bits found, likely all zeros - keep a minimal amount
+        binary_string = binary_string[:8]
     
     # Apply error correction if requested
     if with_error_correction:
@@ -47,7 +59,7 @@ def binary_to_text(binary_tensor, threshold=0.5, with_error_correction=True):
                 
                 # If parity doesn't match, there's an error
                 if computed_parity != parity_bit:
-                    # Simple error handling: we just note it and continue
+                    # Simple error handling: we just note it
                     # In a real system, more sophisticated error correction would be used
                     pass
                 
@@ -62,9 +74,15 @@ def binary_to_text(binary_tensor, threshold=0.5, with_error_correction=True):
         if i + 8 <= len(binary_string):
             byte = binary_string[i:i+8]
             try:
-                text += chr(int(byte, 2))
-            except:
-                # Skip invalid UTF-8 characters
+                char = chr(int(byte, 2))
+                # Only add printable ASCII characters and common whitespace
+                if char.isprintable() or char in ('\n', '\t', ' '):
+                    text += char
+                else:
+                    # Replace unprintable characters with a placeholder
+                    text += '?'
+            except ValueError:
+                # Skip invalid binary sequences
                 pass
     
     return text
@@ -104,15 +122,24 @@ def preprocess_image(image_path, target_size=(512, 512)):
     return transform(image).unsqueeze(0)  # Add batch dimension
 
 
-def extract_patient_data(stego_path, model_path, message_length=256, image_size=(512, 512), use_enhanced_models=True):
-    """Extract patient data from a stego image"""
+def extract_patient_data(stego_path, model_path, message_length=512, image_size=(512, 512), use_enhanced_models=True):
+    """
+    Extract patient data from a stego image
+    
+    Args:
+        stego_path: Path to the stego image
+        model_path: Directory containing trained models
+        message_length: Length of the binary message
+        image_size: Input image size (width, height)
+        use_enhanced_models: Whether to use enhanced models or original models
+    
+    Returns:
+        The extracted patient data as text
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     try:
-        # Import load_correct_models (add this import at the top of the file too)
-        from model_config import load_correct_models
-        
         # Create args object for model loading
         class Args:
             def __init__(self):
@@ -122,13 +149,8 @@ def extract_patient_data(stego_path, model_path, message_length=256, image_size=
         
         args = Args()
         
-        # Load models
-        print(f"Loading models from: {model_path}")
+        # Load decoder model using the correct architecture
         _, _, decoder, _ = load_correct_models(args, device)
-        
-        # Set model to evaluation mode
-        decoder.eval()
-        
         
         # Preprocess image
         stego_tensor = preprocess_image(stego_path, image_size).to(device)
@@ -137,15 +159,24 @@ def extract_patient_data(stego_path, model_path, message_length=256, image_size=
         with torch.no_grad():
             binary_output = decoder(stego_tensor)
         
-        # Convert to text
-        extracted_text = binary_to_text(binary_output[0], threshold=0.5, with_error_correction=True)
+        # Try multiple thresholds for better extraction
+        thresholds = [0.5, 0.4, 0.6, 0.3, 0.7]
+        extracted_texts = []
+        
+        for threshold in thresholds:
+            # Convert to text
+            text = binary_to_text(binary_output[0], threshold=threshold, with_error_correction=True)
+            extracted_texts.append(text)
+        
+        # Choose the best result (the one with the most printable characters)
+        best_text = max(extracted_texts, key=lambda t: sum(1 for c in t if c.isprintable()))
         
         print("\nSuccessfully extracted patient data:")
         print("-" * 40)
-        print(extracted_text)
+        print(best_text)
         print("-" * 40)
         
-        return extracted_text
+        return best_text
         
     except Exception as e:
         print(f"Error extracting data: {e}")
@@ -159,8 +190,8 @@ if __name__ == "__main__":
     parser.add_argument('--image', type=str, required=True, help='Path to the stego image')
     parser.add_argument('--model_path', type=str, default='./models/weights/final_models', help='Path to trained models')
     parser.add_argument('--output', type=str, help='Path to save the extracted text (optional)')
-    parser.add_argument('--message_length', type=int, default=256, help='Binary message length')
-    parser.add_argument('--original_models', action='store_true', help='Use original models instead of enhanced models')
+    parser.add_argument('--message_length', type=int, default=512, help='Binary message length')
+    parser.add_argument('--use_enhanced_models', action='store_true', help='Use enhanced models')
     parser.add_argument('--image_size', type=int, default=512, help='Image size (square)')
     
     args = parser.parse_args()
@@ -172,7 +203,7 @@ if __name__ == "__main__":
         args.model_path, 
         args.message_length, 
         image_size,
-        not args.original_models
+        args.use_enhanced_models
     )
     
     # Save to file if requested

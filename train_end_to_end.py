@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 # Add the project directory to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from exact_model_architecture import ExactFeatureAnalyzer
 from models.feature_analyzer import FeatureAnalysisDenseNet, MedicalFeatureAnalyzer, SimpleFeatureAnalyzer
 from models.encoder import EnhancedSteganographyEncoder, SteganographyEncoder
 from models.decoder import EnhancedSteganographyDecoder, SteganographyDecoder
@@ -113,6 +114,73 @@ def preprocess_patient_data(text, max_length=256):
         binary_tensor = torch.cat([binary_tensor, padding])
     
     return binary_tensor
+
+def initialize_pretrained_feature_analyzer(model, device):
+    """
+    Initialize the feature analyzer with pretrained weights from a medical imaging model
+    
+    Args:
+        model: The feature analyzer model
+        device: Device (cuda/cpu)
+        
+    Returns:
+        Initialized model
+    """
+    try:
+        import torchvision.models as models
+        
+        # Load a pretrained DenseNet
+        print("Loading pretrained DenseNet for feature analyzer...")
+        densenet = models.densenet121(pretrained=True)
+        
+        # Transfer weights where dimensions match
+        print("Transferring compatible weights to feature analyzer...")
+        
+        # First convolutional layer needs special handling for grayscale
+        if hasattr(model, 'features') and hasattr(densenet, 'features'):
+            # For the first layer, average RGB channels to create grayscale weights
+            if hasattr(model.features, '0') and hasattr(densenet.features, '0'):
+                rgb_weights = densenet.features[0].weight.data
+                gray_weights = rgb_weights.mean(dim=1, keepdim=True)
+                
+                # Check and adapt shape if needed
+                if model.features[0].weight.data.shape[2:] == gray_weights.shape[2:]:
+                    model.features[0].weight.data = gray_weights
+        
+        # For the rest of the network, try to transfer compatible layers
+        if hasattr(model, 'blocks') and len(model.blocks) > 0:
+            # Transfer dense block parameters where possible
+            for i, block in enumerate(model.blocks):
+                source_block_name = f'denseblock{i+1}'
+                if hasattr(densenet.features, source_block_name):
+                    source_block = getattr(densenet.features, source_block_name)
+                    
+                    # Transfer compatible layer weights
+                    if hasattr(block, 'layers') and hasattr(source_block, 'denselayer1'):
+                        for j, layer in enumerate(block.layers):
+                            source_layer_name = f'denselayer{j+1}'
+                            if hasattr(source_block, source_layer_name):
+                                source_layer = getattr(source_block, source_layer_name)
+                                
+                                # Transfer compatible norm and conv weights
+                                if hasattr(layer, 'norm') and hasattr(source_layer, 'norm1'):
+                                    if layer.norm.weight.data.shape == source_layer.norm1.weight.data.shape:
+                                        layer.norm.weight.data = source_layer.norm1.weight.data
+                                        layer.norm.bias.data = source_layer.norm1.bias.data
+                                        layer.norm.running_mean = source_layer.norm1.running_mean
+                                        layer.norm.running_var = source_layer.norm1.running_var
+                                
+                                if hasattr(layer, 'conv') and hasattr(source_layer, 'conv1'):
+                                    if layer.conv.weight.data.shape == source_layer.conv1.weight.data.shape:
+                                        layer.conv.weight.data = source_layer.conv1.weight.data
+        
+        print("Pretrained initialization complete")
+        return model
+        
+    except Exception as e:
+        print(f"Error initializing pretrained model: {e}")
+        print("Using random initialization instead")
+        return model
 
 def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator, 
                            noise_layer, train_loader, val_loader, args, device, writer):
@@ -506,7 +574,9 @@ def train(args):
         if args.use_simple_models:
             feature_analyzer = SimpleFeatureAnalyzer(in_channels=1).to(device)
         else:
-            feature_analyzer = MedicalFeatureAnalyzer(in_channels=1, pretrained=args.use_pretrained).to(device)
+            feature_analyzer = ExactFeatureAnalyzer(in_channels=1).to(device)
+            if args.use_pretrained:
+                feature_analyzer = initialize_pretrained_feature_analyzer(feature_analyzer, device)
             
         encoder = EnhancedSteganographyEncoder(image_channels=1, message_length=args.message_length).to(device)
         decoder = EnhancedSteganographyDecoder(image_channels=1, message_length=args.message_length).to(device)
