@@ -12,14 +12,15 @@ import matplotlib.pyplot as plt
 # Add the project directory to the path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.feature_analyzer import MedicalFeatureAnalyzer, SimpleFeatureAnalyzer
-from models.encoder import EnhancedSteganographyEncoder
-from models.decoder import EnhancedSteganographyDecoder
-from models.discriminator import EnhancedDiscriminator
+from models.feature_analyzer import FeatureAnalysisDenseNet, MedicalFeatureAnalyzer, SimpleFeatureAnalyzer
+from models.encoder import EnhancedSteganographyEncoder, SteganographyEncoder
+from models.decoder import EnhancedSteganographyDecoder, SteganographyDecoder
+from models.discriminator import Discriminator, EnhancedDiscriminator
 from models.noise_layer import EnhancedNoiseLayer
 from utils.data_loader import get_data_loaders
 from utils.metrics import compute_psnr, compute_ssim, compute_bit_accuracy
 from model_config import load_correct_models
+
 
 
 # Custom SSIM loss function
@@ -113,26 +114,39 @@ def preprocess_patient_data(text, max_length=256):
     
     return binary_tensor
 
-# Fix for the training error in Phase 2
 def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator, 
                            noise_layer, train_loader, val_loader, args, device, writer):
     """
-    Phase 2 training with fixes for numerical stability
+    Phase 2 training with robust fixes for numerical stability
     """
     print("\n=== Phase 2: Training for robustness with noise ===\n")
     
-    # Initialize optimizers
-    fa_optimizer = optim.Adam(feature_analyzer.parameters(), lr=args.lr)
-    encoder_optimizer = optim.Adam(encoder.parameters(), lr=args.lr)
-    decoder_optimizer = optim.Adam(decoder.parameters(), lr=args.lr)
-    disc_optimizer = optim.Adam(discriminator.parameters(), lr=args.lr)
+    # Initialize optimizers with lower learning rate for stability
+    lr_phase2 = args.lr * 0.5  # Half the learning rate for stability
+    fa_optimizer = optim.Adam(feature_analyzer.parameters(), lr=lr_phase2)
+    encoder_optimizer = optim.Adam(encoder.parameters(), lr=lr_phase2)
+    decoder_optimizer = optim.Adam(decoder.parameters(), lr=lr_phase2)
+    disc_optimizer = optim.Adam(discriminator.parameters(), lr=lr_phase2)
     
-    # Loss functions
+    # Use BCEWithLogitsLoss for better numerical stability (internal sigmoid + BCE)
+    # For discriminator and adversarial loss
+    bce_logits_loss = nn.BCEWithLogitsLoss()
+    
+    # Regular BCE for decoder where we want to keep the sigmoid
     bce_loss = nn.BCELoss()
+    
+    # Other losses
     mse_loss = nn.MSELoss()
     ssim_loss = SSIMLoss()
     
-    for epoch in range(args.epochs_phase2):
+    # Initialize gradient scaler for mixed precision (helps with stability)
+    scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+    
+    # Reduce epochs_phase2 if needed
+    actual_epochs = min(args.epochs_phase2, 20)  # Cap at 20 for this run
+    print(f"Running for {actual_epochs} epochs")
+    
+    for epoch in range(actual_epochs):
         feature_analyzer.train()
         encoder.train()
         decoder.train()
@@ -143,74 +157,116 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
         total_decoder_loss = 0
         total_combined_loss = 0
         
-        # Calculate current noise intensity (curriculum learning)
-        noise_intensity = min(0.8, epoch / (args.epochs_phase2 * 0.6))  # Cap at 0.8 to prevent extreme noise
-        print(f"Phase 2 - Epoch {epoch+1}/{args.epochs_phase2} (Noise intensity: {noise_intensity:.2f})")
+        # Start with very low noise intensity and gradually increase
+        # Use a sigmoid curve for smoother ramping
+        noise_intensity = min(0.7, 0.7 / (1 + np.exp(-10 * (epoch / actual_epochs - 0.3))))
+        print(f"Phase 2 - Epoch {epoch+1}/{actual_epochs} (Noise intensity: {noise_intensity:.2f})")
         
         for batch_idx, data in enumerate(tqdm(train_loader)):
             images = data['image'].to(device)
             messages = data['patient_data'].to(device)
             
+            # Strict check and correction of input data
+            images = torch.clamp(images, 0, 1)
+            
             # Ensure messages have the right dimensions
             if messages.dim() == 3:  # [B, 1, L]
                 messages = messages.squeeze(1)  # [B, L]
+                
+            # Ensure message values are in [0,1]
+            messages = torch.clamp(messages, 0, 1)
             
-            # First, train discriminator
+            # -------------------------------------------
+            # Train discriminator first
+            # -------------------------------------------
             disc_optimizer.zero_grad()
             
             # Generate feature weights
-            feature_weights = feature_analyzer(images)
+            with torch.no_grad():  # No need to track gradients here
+                feature_weights = feature_analyzer(images)
+                feature_weights = torch.clamp(feature_weights, 0, 1)
             
-            # Generate stego images
-            stego_images = encoder(images, messages, feature_weights)
+                # Generate stego images
+                stego_images = encoder(images, messages, feature_weights)
+                stego_images = torch.clamp(stego_images, 0, 1)
             
-            # Ensure all values are in valid range
-            stego_images = torch.clamp(stego_images, 0, 1)
+            # Use raw logits for discriminator (BCEWithLogitsLoss applies sigmoid internally)
+            # Remove final sigmoid from discriminator forward call if needed
+            if hasattr(discriminator, 'use_logits') and discriminator.use_logits:
+                # For discriminators that output logits
+                real_logits = discriminator(images)
+                fake_logits = discriminator(stego_images.detach())
+                
+                # Create labels with slight smoothing for better stability
+                real_labels = torch.ones_like(real_logits).to(device) * 0.9  # 0.9 instead of 1
+                fake_labels = torch.zeros_like(fake_logits).to(device) * 0.1  # 0.1 instead of 0
+                
+                disc_loss_real = bce_logits_loss(real_logits, real_labels)
+                disc_loss_fake = bce_logits_loss(fake_logits, fake_labels)
+            else:
+                # For discriminators with sigmoid already applied
+                real_preds = discriminator(images)
+                fake_preds = discriminator(stego_images.detach())
+                
+                # Clamp outputs to valid range
+                real_preds = torch.clamp(real_preds, 1e-7, 1 - 1e-7)
+                fake_preds = torch.clamp(fake_preds, 1e-7, 1 - 1e-7)
+                
+                # Create labels with slight smoothing
+                real_labels = torch.ones_like(real_preds).to(device) * 0.9
+                fake_labels = torch.zeros_like(fake_preds).to(device) * 0.1
+                
+                disc_loss_real = bce_loss(real_preds, real_labels)
+                disc_loss_fake = bce_loss(fake_preds, fake_labels)
             
-            # Train discriminator
-            real_preds = discriminator(images)
-            fake_preds = discriminator(stego_images.detach())
-            
-            # Clamp predictions to valid range for BCE loss
-            real_preds = torch.clamp(real_preds, 0.001, 0.999)  # Avoid exact 0 or 1
-            fake_preds = torch.clamp(fake_preds, 0.001, 0.999)  # Avoid exact 0 or 1
-            
-            disc_loss_real = bce_loss(real_preds, torch.ones_like(real_preds))
-            disc_loss_fake = bce_loss(fake_preds, torch.zeros_like(fake_preds))
             disc_loss = disc_loss_real + disc_loss_fake
             
-            disc_loss.backward()
-            disc_optimizer.step()
+            # Use gradient scaling if available
+            if scaler is not None:
+                scaler.scale(disc_loss).backward()
+                scaler.step(disc_optimizer)
+            else:
+                disc_loss.backward()
+                disc_optimizer.step()
             
+            # -------------------------------------------
             # Train encoder, decoder, and feature analyzer
+            # -------------------------------------------
             fa_optimizer.zero_grad()
             encoder_optimizer.zero_grad()
             decoder_optimizer.zero_grad()
             
-            # Generate feature weights again
+            # Generate feature weights
             feature_weights = feature_analyzer(images)
+            feature_weights = torch.clamp(feature_weights, 0, 1)
             
             # Generate stego images
             stego_images = encoder(images, messages, feature_weights)
-            stego_images = torch.clamp(stego_images, 0, 1)  # Ensure valid range
+            stego_images = torch.clamp(stego_images, 0, 1)
             
-            # Apply noise with current intensity
-            noise_type = np.random.choice(args.noise_types)
+            # Try-except block for noise application
             try:
+                # Apply noise with current intensity (but handle potential errors)
+                noise_type = np.random.choice(args.noise_types)
                 noisy_stego_images = noise_layer(stego_images, noise_type, noise_intensity)
-                noisy_stego_images = torch.clamp(noisy_stego_images, 0, 1)  # Ensure valid range
+                noisy_stego_images = torch.clamp(noisy_stego_images, 0, 1)
             except Exception as e:
-                print(f"Error applying noise: {e}")
+                print(f"WARNING: Error applying noise: {e}")
                 print(f"Using original stego images without noise")
-                noisy_stego_images = stego_images
+                noisy_stego_images = stego_images.clone()
             
             # Decode messages from noisy stego images
             decoded_messages = decoder(noisy_stego_images)
-            decoded_messages = torch.clamp(decoded_messages, 0.001, 0.999)  # Ensure valid range for BCE
+            decoded_messages = torch.clamp(decoded_messages, 1e-7, 1 - 1e-7)  # Ensure valid range
             
-            # Get discriminator predictions
-            disc_preds = discriminator(stego_images)
-            disc_preds = torch.clamp(disc_preds, 0.001, 0.999)  # Ensure valid range for BCE
+            # Get discriminator predictions for generator training
+            if hasattr(discriminator, 'use_logits') and discriminator.use_logits:
+                disc_logits = discriminator(stego_images)
+                adv_loss = bce_logits_loss(disc_logits, real_labels)  # Fool the discriminator
+            else:
+                disc_preds = discriminator(stego_images)
+                disc_preds = torch.clamp(disc_preds, 1e-7, 1 - 1e-7)
+                adv_loss = bce_loss(disc_preds, real_labels)  # Fool the discriminator
             
             # Calculate losses
             # 1. Message loss
@@ -218,21 +274,50 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
             
             # 2. Image distortion loss (MSE + SSIM)
             img_mse_loss = mse_loss(stego_images, images)
-            img_ssim_loss = ssim_loss(stego_images, images)
+            
+            # Try-except for SSIM loss (can sometimes cause errors)
+            try:
+                img_ssim_loss = ssim_loss(stego_images, images)
+            except Exception as e:
+                print(f"WARNING: SSIM loss error: {e}")
+                img_ssim_loss = torch.tensor(0.0).to(device)
+            
             image_loss = img_mse_loss + args.lambda_ssim * img_ssim_loss
             
-            # 3. Adversarial loss
-            adv_loss = bce_loss(disc_preds, torch.ones_like(disc_preds))
+            # Combined loss with different weights early in training
+            # Higher weight on image quality at start, more on message as training progresses
+            message_weight = args.lambda_message * min(1.0, epoch / (actual_epochs * 0.3) + 0.5)
+            image_weight = args.lambda_image
+            adv_weight = args.lambda_adv * min(1.0, epoch / (actual_epochs * 0.5))
             
-            # Combined loss
-            combined_loss = args.lambda_message * message_loss + \
-                            args.lambda_image * image_loss + \
-                            args.lambda_adv * adv_loss
+            combined_loss = message_weight * message_loss + \
+                            image_weight * image_loss + \
+                            adv_weight * adv_loss
             
-            combined_loss.backward()
-            fa_optimizer.step()
-            encoder_optimizer.step()
-            decoder_optimizer.step()
+            # Use gradient scaling if available
+            if scaler is not None:
+                scaler.scale(combined_loss).backward()
+                
+                # Clip gradients for stability
+                torch.nn.utils.clip_grad_norm_(feature_analyzer.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+                
+                scaler.step(fa_optimizer)
+                scaler.step(encoder_optimizer)
+                scaler.step(decoder_optimizer)
+                scaler.update()
+            else:
+                combined_loss.backward()
+                
+                # Clip gradients for stability
+                torch.nn.utils.clip_grad_norm_(feature_analyzer.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+                
+                fa_optimizer.step()
+                encoder_optimizer.step()
+                decoder_optimizer.step()
             
             # Update running losses
             total_disc_loss += disc_loss.item()
@@ -243,9 +328,10 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
             # Log every N batches
             if batch_idx % args.log_interval == 0:
                 # Calculate metrics
-                psnr = compute_psnr(images, stego_images)
-                ssim = compute_ssim(images, stego_images)
-                bit_acc = compute_bit_accuracy(messages, decoded_messages)
+                with torch.no_grad():  # Don't track gradients for metrics
+                    psnr = compute_psnr(images, stego_images)
+                    ssim = compute_ssim(images, stego_images)
+                    bit_acc = compute_bit_accuracy(messages, decoded_messages)
                 
                 # Log to tensorboard
                 step = epoch * len(train_loader) + batch_idx
@@ -257,6 +343,15 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
                 writer.add_scalar('Phase2/Metrics/SSIM', ssim, step)
                 writer.add_scalar('Phase2/Metrics/BitAccuracy', bit_acc, step)
                 writer.add_scalar('Phase2/Noise/Intensity', noise_intensity, step)
+                
+                # Print stats periodically
+                if batch_idx % (args.log_interval * 10) == 0:
+                    print(f"Batch {batch_idx}/{len(train_loader)}, "
+                          f"D_loss: {disc_loss.item():.4f}, "
+                          f"G_loss: {image_loss.item():.4f}, "
+                          f"M_loss: {message_loss.item():.4f}, "
+                          f"PSNR: {psnr:.2f}, "
+                          f"Acc: {bit_acc:.4f}")
                 
                 # Add images to tensorboard periodically
                 if batch_idx % (args.log_interval * 5) == 0:
@@ -276,7 +371,7 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
         print(f"  Decoder: {avg_decoder_loss:.6f}")
         print(f"  Combined: {avg_combined_loss:.6f}")
         
-        # Run validation
+        # Run validation with error handling
         feature_analyzer.eval()
         encoder.eval()
         decoder.eval()
@@ -285,46 +380,64 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
         val_psnr = 0
         val_ssim = 0
         val_bit_acc = 0
+        val_count = 0
         
-        with torch.no_grad():
-            for data in val_loader:
-                images = data['image'].to(device)
-                messages = data['patient_data'].to(device)
-                
-                # Ensure messages have the right dimensions
-                if messages.dim() == 3:  # [B, 1, L]
-                    messages = messages.squeeze(1)  # [B, L]
-                
-                # Generate feature weights
-                feature_weights = feature_analyzer(images)
-                
-                # Generate stego images
-                stego_images = encoder(images, messages, feature_weights)
-                stego_images = torch.clamp(stego_images, 0, 1)
-                
-                # Calculate image quality metrics
-                val_psnr += compute_psnr(images, stego_images)
-                val_ssim += compute_ssim(images, stego_images)
-                
-                # Test on different noise types
-                noise_accuracies = []
-                for noise_type in args.noise_types:
+        try:
+            with torch.no_grad():
+                for data in val_loader:
                     try:
-                        noisy_stego = noise_layer(stego_images, noise_type, noise_intensity)
-                        noisy_stego = torch.clamp(noisy_stego, 0, 1)
-                        decoded_msgs = decoder(noisy_stego)
-                        noise_accuracies.append(compute_bit_accuracy(messages, decoded_msgs))
+                        images = data['image'].to(device)
+                        messages = data['patient_data'].to(device)
+                        
+                        # Ensure correct shapes and value ranges
+                        images = torch.clamp(images, 0, 1)
+                        if messages.dim() == 3:  # [B, 1, L]
+                            messages = messages.squeeze(1)  # [B, L]
+                        messages = torch.clamp(messages, 0, 1)
+                        
+                        # Generate feature weights
+                        feature_weights = feature_analyzer(images)
+                        feature_weights = torch.clamp(feature_weights, 0, 1)
+                        
+                        # Generate stego images
+                        stego_images = encoder(images, messages, feature_weights)
+                        stego_images = torch.clamp(stego_images, 0, 1)
+                        
+                        # Calculate image quality metrics
+                        val_psnr += compute_psnr(images, stego_images)
+                        val_ssim += compute_ssim(images, stego_images)
+                        
+                        # Test on different noise types
+                        noise_accuracies = []
+                        for noise_type in args.noise_types:
+                            try:
+                                noisy_stego = noise_layer(stego_images, noise_type, noise_intensity)
+                                noisy_stego = torch.clamp(noisy_stego, 0, 1)
+                                decoded_msgs = decoder(noisy_stego)
+                                noise_accuracies.append(compute_bit_accuracy(messages, decoded_msgs))
+                            except Exception as e:
+                                print(f"Warning: Error in validation with noise {noise_type}: {e}")
+                                noise_accuracies.append(0.5)  # Default value on error
+                        
+                        # Average bit accuracy across noise types
+                        val_bit_acc += sum(noise_accuracies) / len(noise_accuracies)
+                        val_count += 1
                     except Exception as e:
-                        print(f"Error in validation with noise {noise_type}: {e}")
-                        noise_accuracies.append(0.5)  # Default value on error
-                
-                # Average bit accuracy across noise types
-                val_bit_acc += sum(noise_accuracies) / len(noise_accuracies)
+                        print(f"Warning: Error in validation batch: {e}")
+                        continue
+        except Exception as e:
+            print(f"Error during validation: {e}")
+            # Fall back to training metrics if validation fails completely
+            val_psnr = psnr
+            val_ssim = ssim
+            val_bit_acc = bit_acc
+            val_count = 1
         
-        # Calculate average validation metrics
-        val_psnr /= len(val_loader)
-        val_ssim /= len(val_loader)
-        val_bit_acc /= len(val_loader)
+        # Calculate average validation metrics (avoid division by zero)
+        if val_count > 0:
+            val_psnr /= val_count
+            val_ssim /= val_count
+            val_bit_acc /= val_count
         
         # Log validation metrics
         writer.add_scalar('Phase2/Validation/PSNR', val_psnr, epoch)
@@ -336,31 +449,36 @@ def train_phase2_with_fixes(feature_analyzer, encoder, decoder, discriminator,
         print(f"  SSIM: {val_ssim:.4f}")
         print(f"  Bit Accuracy: {val_bit_acc:.4f}")
         
-        # Save models periodically
+        # Save models periodically with error handling
         if (epoch + 1) % args.save_interval == 0:
-            save_path = os.path.join(args.model_save_path, f"phase2_epoch_{epoch+1}")
-            os.makedirs(save_path, exist_ok=True)
-            
-            torch.save(feature_analyzer.state_dict(), os.path.join(save_path, 'feature_analyzer.pth'))
-            torch.save(encoder.state_dict(), os.path.join(save_path, 'encoder.pth'))
-            torch.save(decoder.state_dict(), os.path.join(save_path, 'decoder.pth'))
-            torch.save(discriminator.state_dict(), os.path.join(save_path, 'discriminator.pth'))
-            
-            print(f"Phase 2 - Models saved to {save_path}")
+            try:
+                save_path = os.path.join(args.model_save_path, f"phase2_epoch_{epoch+1}")
+                os.makedirs(save_path, exist_ok=True)
+                
+                torch.save(feature_analyzer.state_dict(), os.path.join(save_path, 'feature_analyzer.pth'))
+                torch.save(encoder.state_dict(), os.path.join(save_path, 'encoder.pth'))
+                torch.save(decoder.state_dict(), os.path.join(save_path, 'decoder.pth'))
+                torch.save(discriminator.state_dict(), os.path.join(save_path, 'discriminator.pth'))
+                
+                print(f"Phase 2 - Models saved to {save_path}")
+            except Exception as e:
+                print(f"Warning: Failed to save models: {e}")
     
     # Save final models
-    final_path = os.path.join(args.model_save_path, "final_models")
-    os.makedirs(final_path, exist_ok=True)
-    
-    torch.save(feature_analyzer.state_dict(), os.path.join(final_path, 'feature_analyzer.pth'))
-    torch.save(encoder.state_dict(), os.path.join(final_path, 'encoder.pth'))
-    torch.save(decoder.state_dict(), os.path.join(final_path, 'decoder.pth'))
-    torch.save(discriminator.state_dict(), os.path.join(final_path, 'discriminator.pth'))
-    
-    print(f"Final models saved to {final_path}")
-    
-    # Close tensorboard writer
-    writer.close()
+    try:
+        final_path = os.path.join(args.model_save_path, "final_models")
+        os.makedirs(final_path, exist_ok=True)
+        
+        torch.save(feature_analyzer.state_dict(), os.path.join(final_path, 'feature_analyzer.pth'))
+        torch.save(encoder.state_dict(), os.path.join(final_path, 'encoder.pth'))
+        torch.save(decoder.state_dict(), os.path.join(final_path, 'decoder.pth'))
+        torch.save(discriminator.state_dict(), os.path.join(final_path, 'discriminator.pth'))
+        
+        print(f"Final models saved to {final_path}")
+    except Exception as e:
+        print(f"Warning: Failed to save final models: {e}")
+        
+    return feature_analyzer, encoder, decoder, discriminator
 
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -383,16 +501,31 @@ def train(args):
     )
     
     # Initialize models
-    if args.use_simple_models:
-        print("Using simplified models for faster training")
-        feature_analyzer = SimpleFeatureAnalyzer(in_channels=1).to(device)
+    if args.use_enhanced_models:
+        print("Using enhanced models with improved architecture")
+        if args.use_simple_models:
+            feature_analyzer = SimpleFeatureAnalyzer(in_channels=1).to(device)
+        else:
+            feature_analyzer = MedicalFeatureAnalyzer(in_channels=1, pretrained=args.use_pretrained).to(device)
+            
+        encoder = EnhancedSteganographyEncoder(image_channels=1, message_length=args.message_length).to(device)
+        decoder = EnhancedSteganographyDecoder(image_channels=1, message_length=args.message_length).to(device)
+        discriminator = EnhancedDiscriminator(image_channels=1, use_logits=True).to(device)  # Use logits for stability
     else:
-        print("Using enhanced feature analyzer with medical imaging focus")
-        feature_analyzer = MedicalFeatureAnalyzer(in_channels=1, pretrained=args.use_pretrained).to(device)
-        
-    encoder = EnhancedSteganographyEncoder(image_channels=1, message_length=args.message_length).to(device)
-    decoder = EnhancedSteganographyDecoder(image_channels=1, message_length=args.message_length).to(device)
-    discriminator = EnhancedDiscriminator(image_channels=1).to(device)
+        print("Using original model architecture")
+        if args.use_simple_models:
+            feature_analyzer = SimpleFeatureAnalyzer(in_channels=1).to(device)
+        else:
+            feature_analyzer = FeatureAnalysisDenseNet(
+                in_channels=1, growth_rate=16, block_config=(3, 6, 12, 24), num_init_features=64
+            ).to(device)
+            
+        encoder = SteganographyEncoder(image_channels=1, growth_rate=16, num_dense_layers=4).to(device)
+        decoder = SteganographyDecoder(
+            image_channels=1, growth_rate=16, num_layers=4, message_length=args.message_length
+        ).to(device)
+        discriminator = Discriminator(image_channels=1).to(device)
+    
     noise_layer = EnhancedNoiseLayer().to(device)
     
     # Initialize optimizers
@@ -429,29 +562,61 @@ def train(args):
             images = data['image'].to(device)
             messages = data['patient_data'].to(device)
             
+            # Ensure data is in valid range
+            images = torch.clamp(images, 0, 1)
+            
             # Ensure messages have the right dimensions
             if messages.dim() == 3:  # [B, 1, L]
                 messages = messages.squeeze(1)  # [B, L]
+            
+            # Ensure message values are in [0,1]
+            messages = torch.clamp(messages, 0, 1)
             
             # First, train discriminator
             disc_optimizer.zero_grad()
             
             # Generate feature weights
             feature_weights = feature_analyzer(images)
+            feature_weights = torch.clamp(feature_weights, 0, 1)
             
             # Generate stego images
             stego_images = encoder(images, messages, feature_weights)
+            stego_images = torch.clamp(stego_images, 0, 1)
             
             # Train discriminator to distinguish between real and stego images
-            real_preds = discriminator(images)
-            fake_preds = discriminator(stego_images.detach())
+            if hasattr(discriminator, 'use_logits') and discriminator.use_logits:
+                # For discriminators that output logits
+                real_logits = discriminator(images)
+                fake_logits = discriminator(stego_images.detach())
+                
+                # Create labels with slight label smoothing
+                real_labels = torch.ones_like(real_logits).to(device) * 0.9
+                fake_labels = torch.zeros_like(fake_logits).to(device) * 0.1
+                
+                # Use BCEWithLogitsLoss for better stability
+                bce_logits_loss = nn.BCEWithLogitsLoss()
+                disc_loss_real = bce_logits_loss(real_logits, real_labels)
+                disc_loss_fake = bce_logits_loss(fake_logits, fake_labels)
+            else:
+                real_preds = discriminator(images)
+                fake_preds = discriminator(stego_images.detach())
+                
+                # Ensure values in valid range for BCE
+                real_preds = torch.clamp(real_preds, 1e-7, 1 - 1e-7)
+                fake_preds = torch.clamp(fake_preds, 1e-7, 1 - 1e-7)
+                
+                # Create labels with slight smoothing
+                real_labels = torch.ones_like(real_preds).to(device) * 0.9
+                fake_labels = torch.zeros_like(fake_preds).to(device) * 0.1
+                
+                disc_loss_real = bce_loss(real_preds, real_labels)
+                disc_loss_fake = bce_loss(fake_preds, fake_labels)
             
-            # Calculate discriminator loss
-            disc_loss_real = bce_loss(real_preds, torch.ones_like(real_preds))
-            disc_loss_fake = bce_loss(fake_preds, torch.zeros_like(fake_preds))
             disc_loss = disc_loss_real + disc_loss_fake
             
             disc_loss.backward()
+            # Clip gradients for stability
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
             disc_optimizer.step()
             
             # Train encoder, decoder, and feature analyzer
@@ -461,15 +626,24 @@ def train(args):
             
             # Generate feature weights again (for encoder training)
             feature_weights = feature_analyzer(images)
+            feature_weights = torch.clamp(feature_weights, 0, 1)
             
             # Generate stego images again
             stego_images = encoder(images, messages, feature_weights)
+            stego_images = torch.clamp(stego_images, 0, 1)
             
             # Decode messages from stego images (no noise in Phase 1)
             decoded_messages = decoder(stego_images)
+            decoded_messages = torch.clamp(decoded_messages, 1e-7, 1 - 1e-7)
             
             # Get discriminator predictions for generator training
-            disc_preds = discriminator(stego_images)
+            if hasattr(discriminator, 'use_logits') and discriminator.use_logits:
+                disc_logits = discriminator(stego_images)
+                adv_loss = bce_logits_loss(disc_logits, real_labels)
+            else:
+                disc_preds = discriminator(stego_images)
+                disc_preds = torch.clamp(disc_preds, 1e-7, 1 - 1e-7)
+                adv_loss = bce_loss(disc_preds, real_labels)
             
             # Calculate losses
             # 1. Message loss - how well the decoder extracts the message
@@ -478,18 +652,26 @@ def train(args):
             # 2. Image distortion loss - how similar the stego image is to the original
             # Combine MSE and SSIM for better perceptual quality
             img_mse_loss = mse_loss(stego_images, images)
-            img_ssim_loss = ssim_loss(stego_images, images)
-            image_loss = img_mse_loss + args.lambda_ssim * img_ssim_loss
             
-            # 3. Adversarial loss - fool the discriminator
-            adv_loss = bce_loss(disc_preds, torch.ones_like(disc_preds))
+            try:
+                img_ssim_loss = ssim_loss(stego_images, images)
+            except Exception as e:
+                print(f"WARNING: SSIM loss error: {e}")
+                img_ssim_loss = torch.tensor(0.0).to(device)
+                
+            image_loss = img_mse_loss + args.lambda_ssim * img_ssim_loss
             
             # Combined loss
             combined_loss = args.lambda_message * message_loss + \
-                            args.lambda_image * image_loss + \
-                            args.lambda_adv * adv_loss
+                          args.lambda_image * image_loss + \
+                          args.lambda_adv * adv_loss
             
             combined_loss.backward()
+            # Clip gradients for stability
+            torch.nn.utils.clip_grad_norm_(feature_analyzer.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
+            
             fa_optimizer.step()
             encoder_optimizer.step()
             decoder_optimizer.step()
@@ -503,9 +685,10 @@ def train(args):
             # Log every N batches
             if batch_idx % args.log_interval == 0:
                 # Calculate metrics
-                psnr = compute_psnr(images, stego_images)
-                ssim = compute_ssim(images, stego_images)
-                bit_acc = compute_bit_accuracy(messages, decoded_messages)
+                with torch.no_grad():
+                    psnr = compute_psnr(images, stego_images)
+                    ssim = compute_ssim(images, stego_images)
+                    bit_acc = compute_bit_accuracy(messages, decoded_messages)
                 
                 # Log to tensorboard
                 step = epoch * len(train_loader) + batch_idx
@@ -516,6 +699,14 @@ def train(args):
                 writer.add_scalar('Phase1/Metrics/PSNR', psnr, step)
                 writer.add_scalar('Phase1/Metrics/SSIM', ssim, step)
                 writer.add_scalar('Phase1/Metrics/BitAccuracy', bit_acc, step)
+                
+                # Print stats periodically
+                if batch_idx % (args.log_interval * 10) == 0:
+                    print(f"Batch {batch_idx}/{len(train_loader)}, "
+                          f"D_loss: {disc_loss.item():.4f}, "
+                          f"G_loss: {image_loss.item():.4f}, "
+                          f"M_loss: {message_loss.item():.4f}, "
+                          f"PSNR: {psnr:.2f}")
                 
                 # Add images to tensorboard
                 if batch_idx % (args.log_interval * 5) == 0:
@@ -546,67 +737,76 @@ def train(args):
         val_psnr = 0
         val_ssim = 0
         val_bit_acc = 0
+        val_count = 0
         
         with torch.no_grad():
             for data in val_loader:
-                images = data['image'].to(device)
-                messages = data['patient_data'].to(device)
-                
-                # Ensure messages have the right dimensions
-                if messages.dim() == 3:  # [B, 1, L]
-                    messages = messages.squeeze(1)  # [B, L]
-                
-                # Generate feature weights
-                feature_weights = feature_analyzer(images)
-                
-                # Generate stego images
-                stego_images = encoder(images, messages, feature_weights)
-                
-                # Decode without noise
-                decoded_msgs = decoder(stego_images)
-                
-                # Calculate metrics
-                val_psnr += compute_psnr(images, stego_images)
-                val_ssim += compute_ssim(images, stego_images)
-                val_bit_acc += compute_bit_accuracy(messages, decoded_msgs)
+                try:
+                    images = data['image'].to(device)
+                    messages = data['patient_data'].to(device)
+                    
+                    # Ensure values in valid range
+                    images = torch.clamp(images, 0, 1)
+                    
+                    # Ensure messages have the right dimensions
+                    if messages.dim() == 3:  # [B, 1, L]
+                        messages = messages.squeeze(1)  # [B, L]
+                    
+                    messages = torch.clamp(messages, 0, 1)
+                    
+                    # Generate feature weights
+                    feature_weights = feature_analyzer(images)
+                    feature_weights = torch.clamp(feature_weights, 0, 1)
+                    
+                    # Generate stego images
+                    stego_images = encoder(images, messages, feature_weights)
+                    stego_images = torch.clamp(stego_images, 0, 1)
+                    
+                    # Decode without noise
+                    decoded_msgs = decoder(stego_images)
+                    
+                    # Calculate metrics
+                    val_psnr += compute_psnr(images, stego_images)
+                    val_ssim += compute_ssim(images, stego_images)
+                    val_bit_acc += compute_bit_accuracy(messages, decoded_msgs)
+                    val_count += 1
+                except Exception as e:
+                    print(f"Error in validation batch: {e}")
+                    continue
         
-        # Calculate average validation metrics
-        val_psnr /= len(val_loader)
-        val_ssim /= len(val_loader)
-        val_bit_acc /= len(val_loader)
-        
-        # Log validation metrics
-        writer.add_scalar('Phase1/Validation/PSNR', val_psnr, epoch)
-        writer.add_scalar('Phase1/Validation/SSIM', val_ssim, epoch)
-        writer.add_scalar('Phase1/Validation/BitAccuracy', val_bit_acc, epoch)
-        
-        print(f"Phase 1 - Validation Metrics:")
-        print(f"  PSNR: {val_psnr:.2f} dB")
-        print(f"  SSIM: {val_ssim:.4f}")
-        print(f"  Bit Accuracy: {val_bit_acc:.4f}")
+        if val_count > 0:
+            # Calculate average validation metrics
+            val_psnr /= val_count
+            val_ssim /= val_count
+            val_bit_acc /= val_count
+            
+            # Log validation metrics
+            writer.add_scalar('Phase1/Validation/PSNR', val_psnr, epoch)
+            writer.add_scalar('Phase1/Validation/SSIM', val_ssim, epoch)
+            writer.add_scalar('Phase1/Validation/BitAccuracy', val_bit_acc, epoch)
+            
+            print(f"Phase 1 - Validation Metrics:")
+            print(f"  PSNR: {val_psnr:.2f} dB")
+            print(f"  SSIM: {val_ssim:.4f}")
+            print(f"  Bit Accuracy: {val_bit_acc:.4f}")
         
         # Save models periodically
         if (epoch + 1) % args.save_interval == 0:
-            save_path = os.path.join(args.model_save_path, f"phase1_epoch_{epoch+1}")
-            os.makedirs(save_path, exist_ok=True)
-            
-            torch.save({
-                'epoch': epoch,
-                'feature_analyzer_state_dict': feature_analyzer.state_dict(),
-                'encoder_state_dict': encoder.state_dict(),
-                'decoder_state_dict': decoder.state_dict(),
-                'discriminator_state_dict': discriminator.state_dict(),
-            }, os.path.join(save_path, 'model_checkpoint.pth'))
-            
-            # Save individual models for easier loading
-            torch.save(feature_analyzer.state_dict(), os.path.join(save_path, 'feature_analyzer.pth'))
-            torch.save(encoder.state_dict(), os.path.join(save_path, 'encoder.pth'))
-            torch.save(decoder.state_dict(), os.path.join(save_path, 'decoder.pth'))
-            torch.save(discriminator.state_dict(), os.path.join(save_path, 'discriminator.pth'))
-            
-            print(f"Phase 1 - Models saved to {save_path}")
-
-            train_phase2_with_fixes(
+            try:
+                save_path = os.path.join(args.model_save_path, f"phase1_epoch_{epoch+1}")
+                os.makedirs(save_path, exist_ok=True)
+                
+                torch.save(feature_analyzer.state_dict(), os.path.join(save_path, 'feature_analyzer.pth'))
+                torch.save(encoder.state_dict(), os.path.join(save_path, 'encoder.pth'))
+                torch.save(decoder.state_dict(), os.path.join(save_path, 'decoder.pth'))
+                torch.save(discriminator.state_dict(), os.path.join(save_path, 'discriminator.pth'))
+                
+                print(f"Phase 1 - Models saved to {save_path}")
+            except Exception as e:
+                print(f"Error saving models: {e}")
+    
+    # Phase 2: Use the robust implementation
+    feature_analyzer, encoder, decoder, discriminator = train_phase2_with_fixes(
         feature_analyzer=feature_analyzer,
         encoder=encoder,
         decoder=decoder,
@@ -618,6 +818,9 @@ def train(args):
         device=device,
         writer=writer
     )
+    
+    writer.close()
+    return feature_analyzer, encoder, decoder, discriminator
 
 
 

@@ -5,8 +5,11 @@ from torch.nn.utils import spectral_norm
 
 
 class EnhancedDiscriminator(nn.Module):
-    def __init__(self, image_channels=1):
+    def __init__(self, image_channels=1, use_logits=True):
         super(EnhancedDiscriminator, self).__init__()
+        
+        # Flag to indicate whether to return logits or probabilities
+        self.use_logits = use_logits
         
         # Use spectral normalization for stability
         self.model = nn.Sequential(
@@ -35,16 +38,24 @@ class EnhancedDiscriminator(nn.Module):
         self.fc = nn.Sequential(
             spectral_norm(nn.Linear(512, 128)),
             nn.LeakyReLU(0.2, inplace=True),
-            spectral_norm(nn.Linear(128, 1)),
-            nn.Sigmoid()
+            spectral_norm(nn.Linear(128, 1))
         )
+        
+        # Sigmoid activation (only used if use_logits=False)
+        self.sigmoid = nn.Sigmoid()
         
     def forward(self, x):
         features = self.model(x)
         features = self.avg_pool(features)
         features = features.view(features.size(0), -1)
-        output = self.fc(features)
-        return output
+        logits = self.fc(features)
+        
+        if self.use_logits:
+            # Return raw logits for BCEWithLogitsLoss
+            return logits
+        else:
+            # Return probabilities for regular BCE
+            return self.sigmoid(logits)
 
 
 # Original implementation (for compatibility with older code)
